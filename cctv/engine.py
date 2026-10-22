@@ -33,44 +33,55 @@ def point_in_poly(point, polygon):
     return inside
 
 
-def side_of_line(point, line):
-    (ax,ay),(bx,by)=line; x,y=point
-    return (bx-ax)*(y-ay)-(by-ay)*(x-ax)
-
-
 class CountEngine:
-    def __init__(self, rois, lanes=3, lle=3.5, tb_share=.3, bus_bb=1., window_sec=300, min_hits=3, warmup_sec=60):
+    def __init__(self, rois, lanes=3, lle=3.5, tb_share=.3, bus_bb=1., window_sec=300, min_hits=3, warmup_sec=60, stitch_sec=1.5):
         self.rois=rois; self.lanes=lanes; self.lle=lle; self.tb_share=tb_share; self.bus_bb=bus_bb
-        self.window_sec=window_sec; self.min_hits=min_hits; self.warmup_sec=warmup_sec; self.reset()
+        self.window_sec=window_sec; self.min_hits=min_hits; self.warmup_sec=warmup_sec; self.stitch_sec=stitch_sec; self.reset()
 
     def reset(self):
-        self.events=[]; self.counted_ids=set(); self.states={}; self.tracks={}; self.cum=Counter(); self.last_event=None; self.flash=set(); self.started=None
+        self.events=[]; self.counted_ids=set(); self.states={}; self.tracks={}; self.cum=Counter(); self.last_event=None; self.flash=set(); self.started=None; self.recent_lost=[]
 
     def update(self,dets,now):
+        # Aturan hitung: kendaraan MULAI dilacak saat titik bawah kotaknya masuk polygon ROI,
+        # DIHITUNG saat titik itu keluar dari polygon (minimal min_hits frame di dalam ROI).
+        # Cadangan: kalau track hilang di dalam ROI >= 0,5 dtk, dihitung juga (via 'hilang').
+        # Penyambungan ID: kalau tracker kehilangan kendaraan lalu memberi ID baru di dekat posisi
+        # perkiraannya (dalam stitch_sec detik), keduanya dianggap SATU kendaraan -> tidak dihitung dua kali.
         if self.started is None: self.started=now
         self.flash=set(); seen=set(); emitted=[]
+        self.tracks={}   # hanya kendaraan yang terdeteksi di frame ini (dulu ID di luar ROI nggak pernah dihapus -> kotak hantu)
+        self.recent_lost=[s for s in self.recent_lost if now-s['last']<=self.stitch_sec+1.]
         for tid,label,conf,box in dets:
             tid=int(tid); seen.add(tid); x1,y1,x2,y2=box; p=((x1+x2)/2,y2)
             name=next((n for n,r in self.rois.items() if point_in_poly(p,r['polygon'])),None)
             state=self.states.get(tid)
-            if state is None and name: state={'roi':name,'hits':0,'votes':Counter(),'prev':None,'first':now,'last':now,'class':None}; self.states[tid]=state
+            if state is None and name:
+                state={'id':tid,'roi':name,'hits':0,'votes':Counter(),'first':now,'last':now,'class':None,'first_point':p,'last_point':p,'p_prev':p,'t_prev':now,'v':(0.,0.),'last_box':box,'dup':None,'stitched':None}
+                if self.stitch_sec>0:
+                    state['dup']=next((rl['id'] for rl in self.recent_lost if rl['roi']==name and 0<=now-rl['last']<=self.stitch_sec and self._gap(rl,p,now)[0]),None)
+                self.states[tid]=state
             if state:
-                state['last']=now
+                dt=now-state['t_prev']
+                if dt>0:
+                    raw=((p[0]-state['p_prev'][0])/dt,(p[1]-state['p_prev'][1])/dt); vx,vy=state['v']
+                    state['v']=(.5*vx+.5*raw[0],.5*vy+.5*raw[1]); state['p_prev']=p; state['t_prev']=now
+                state['last']=now; state['last_point']=p; state['last_box']=box
                 if name==state['roi']:
                     state['hits']+=1
-                    if label in ('MP','BUS','TRUK'): state['votes'][label]+=1
+                    # suara kelas diberi bobot tinggi kotak x confidence: deteksi besar/dekat lebih dipercaya daripada yang kecil/jauh
+                    if label in ('MP','BUS','TRUK','KS','BB','TB'): state['votes'][label]+=max(1.,y2-y1)*float(conf)
                     state['class']=state['votes'].most_common(1)[0][0] if state['votes'] else label
-                    line=self.rois[state['roi']]['line']; side=side_of_line(p,line); prev=state['prev']; prev_point=state.get('prev_point'); direction=self.rois[state['roi']]['direction']
-                    crossed=prev is not None and ((prev<=0<side) if direction=='down' else (prev>0>=side)) and self._crosses(prev,side,prev_point,p,line)
-                    state['prev']=side; state['prev_point']=p
-                    if crossed: self._count(tid,state,now,'line',emitted)
-                if tid not in self.counted_ids and state['hits']>=self.min_hits and name!=state['roi']:
-                    self._count(tid,state,now,'fallback',emitted)
+                elif tid not in self.counted_ids and state['hits']>=self.min_hits:
+                    self._count(tid,state,now,'keluar',emitted)
             status='sudah dihitung' if tid in self.counted_ids else 'di dalam ROI' if state and name==state['roi'] else 'di luar ROI'
             self.tracks[tid]={'box':box,'status':status,'class':state['class'] if state else label,'roi':state['roi'] if state else name}
         for tid,s in list(self.states.items()):
             if tid not in seen and tid not in self.counted_ids and s['hits']>=self.min_hits and now-s['last']>=.5:
-                self._count(tid,s,now,'fallback',emitted)
+                succ=self._find_successor(tid,s,seen) if self.stitch_sec>0 else None
+                if succ is not None: self._merge(tid,s,succ,now,emitted)
+                else:
+                    self._count(tid,s,now,'hilang',emitted)
+                    if tid in self.counted_ids: self.recent_lost.append(s)
         for tid,s in list(self.states.items()):
             if now-s['last']>2:
                 self.states.pop(tid)
@@ -78,18 +89,35 @@ class CountEngine:
         return emitted
 
     @staticmethod
-    def _crosses(s1,s2,p1,p2,line):
-        (ax,ay),(bx,by)=line; dx,dy=bx-ax,by-ay; den=s1-s2
-        if not den or dx*dx+dy*dy == 0: return False
-        t=s1/den
-        ix=p1[0]+t*(p2[0]-p1[0]); iy=p1[1]+t*(p2[1]-p1[1])
-        projection=((ix-ax)*dx+(iy-ay)*dy)/(dx*dx+dy*dy)
-        return 0 <= projection <= 1
+    def _gap(a,point,t):
+        # jarak titik 'point' (muncul pada waktu t) ke posisi PERKIRAAN state a (posisi terakhir + kecepatan x selisih waktu); True kalau di dalam gerbang
+        dt=max(-.5,min(2.,t-a['last'])); vx,vy=a['v']; px=a['last_point'][0]+vx*dt; py=a['last_point'][1]+vy*dt
+        x1,y1,x2,y2=a['last_box']; r=max(40.,1.5*max(x2-x1,y2-y1)); d=math.hypot(point[0]-px,point[1]-py)
+        return d<=r,d
+
+    def _find_successor(self,tid,s,seen):
+        best=None; bd=None
+        for t2,s2 in self.states.items():
+            if t2==tid or t2 not in seen or t2 in self.counted_ids or s2['roi']!=s['roi'] or s2['dup'] is not None: continue
+            if s2['first']<s['last']-1.: continue
+            near,d=self._gap(s,s2['first_point'],s2['first'])
+            if near and (bd is None or d<bd): best,bd=t2,d
+        return best
+
+    def _merge(self,tid,s,t2,now,out):
+        s2=self.states[t2]
+        for k,v in s['votes'].items(): s2['votes'][k]+=v
+        s2['hits']+=s['hits']; s2['first']=min(s2['first'],s['first']); s2['stitched']=tid
+        s2['class']=s2['votes'].most_common(1)[0][0] if s2['votes'] else s2['class']
+        self.counted_ids.add(tid)
+        out.append({'time':now,'direction':s['roi'],'class':s['class'] or 'MP','id':tid,'via':f'disambung ke #{t2}'})
 
     def _count(self,tid,s,now,via,out):
         if tid in self.counted_ids:return
+        if s.get('dup') is not None:
+            self.counted_ids.add(tid); out.append({'time':now,'direction':s['roi'],'class':s['class'] or 'MP','id':tid,'via':f"duplikat #{s['dup']}"}); return
         label=s['class'] or 'MP'
-        mapping={'MP': [('MP',1)],'BUS':[('BB',self.bus_bb),('KS',1-self.bus_bb)],'TRUK':[('TB',self.tb_share),('KS',1-self.tb_share)]}
+        mapping={'MP': [('MP',1)],'KS':[('KS',1)],'BB':[('BB',1)],'TB':[('TB',1)],'BUS':[('BB',self.bus_bb),('KS',1-self.bus_bb)],'TRUK':[('TB',self.tb_share),('KS',1-self.tb_share)]}
         self.counted_ids.add(tid)
         for cls,share in mapping.get(label,[]):
             if share: self.events.append({'time':now,'roi':s['roi'],'class':cls,'id':tid,'via':via,'count':share}); self.cum[(s['roi'],cls)]+=share
