@@ -110,6 +110,22 @@ class Processor(QThread):
             for b,tid,cl,cf in zip(result.boxes.xyxy.cpu().numpy(),result.boxes.id.int().cpu().tolist(),result.boxes.cls.int().cpu().tolist(),result.boxes.conf.cpu().tolist()):dets.append((tid,label_map[cl],cf,(b[0]+x0,b[1]+y0,b[2]+x0,b[3]+y0)))
         return dets
     def run(self):
+        # Baris penting untuk memperbaiki NameError
+        model = None if self.args.demo else YOLO(self.args.model)
+        last = 0
+
+        if model is not None:
+            label_map = {
+                i: LABEL_ALIAS[n.lower()]
+                for i, n in model.names.items()
+                if n.lower() in LABEL_ALIAS
+            }
+            if not label_map:
+                raise RuntimeError(
+                    f"Nama kelas model tidak dikenali: {model.names}"
+                )
+            self.classes = list(label_map)
+
         model=None if self.args.demo else YOLO(self.args.model); last=0
         if model is not None:
             label_map={i:LABEL_ALIAS[n.lower()] for i,n in model.names.items() if n.lower() in LABEL_ALIAS}
