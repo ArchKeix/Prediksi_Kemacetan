@@ -6,7 +6,7 @@ import numpy as np
 from ultralytics import YOLO
 from PySide6.QtCore import QThread, Signal, Qt, QTimer, QPointF
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QFormLayout, QLineEdit, QPlainTextEdit, QMessageBox, QComboBox
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QFormLayout, QLineEdit, QPlainTextEdit, QMessageBox, QComboBox, QRadioButton
 from engine import CountEngine
 
 # nama kelas model -> label internal engine.
@@ -53,9 +53,13 @@ class VideoView(QLabel):
         if not self.pix:return
         s,ox,oy=self.mapping(); p.drawPixmap(int(ox),int(oy),int(self.pix.width()*s),int(self.pix.height()*s),self.pix); p.save();p.translate(ox,oy);p.scale(s,s)
         for n,r in self.rois.items():
-            col=Qt.GlobalColor.yellow if self.edit and n==self.selected else Qt.GlobalColor.cyan if n=='Cibitung' else Qt.GlobalColor.magenta
+            col=Qt.GlobalColor.yellow if self.edit and n==self.selected else Qt.GlobalColor.cyan if n=='Arah_Kanan' else Qt.GlobalColor.magenta
             p.setPen(QPen(col,2/s)); p.drawPolygon(QPolygonF([QPointF(*pt) for pt in r['polygon']]))
             for pt in r['polygon']:p.drawEllipse(QPointF(*pt),5/s,5/s)
+            if r.get('line'):
+                p.setPen(QPen(Qt.GlobalColor.green,3/s));p.drawLine(QPointF(*r['line'][0]),QPointF(*r['line'][1]))
+                if self.edit and n==self.selected:
+                    for pt in r['line']:p.drawEllipse(QPointF(*pt),7/s,7/s)
         if self.edit:
             p.setPen(QPen(Qt.GlobalColor.white));p.drawText(QPointF(12,24),f'Edit {self.selected} — drag titik untuk ubah; Backspace hapus titik terakhir, klik titik baru, Enter selesai')
         p.restore()
@@ -68,9 +72,14 @@ class VideoView(QLabel):
         if not self.edit or not self.pix:return
         self.setFocus();x,y=self.to_image(e.position().x(),e.position().y()); r=self.rois.get(self.selected)
         if r is None:return
-        self.drag=next((i for i,(px,py) in enumerate(r['polygon']) if (px-x)**2+(py-y)**2<100),None)
+        self.drag=next((('poly',i) for i,(px,py) in enumerate(r['polygon']) if (px-x)**2+(py-y)**2<100),None)
+        if self.drag is None and r.get('line'):
+            self.drag=next((('line',i) for i,(px,py) in enumerate(r['line']) if (px-x)**2+(py-y)**2<160),None)
         if self.drag is not None:return
         if self.phase=='poly':r['polygon'].append([round(x),round(y)])
+        elif self.phase=='line':
+            if len(r.get('line',[]))<2:r.setdefault('line',[]).append([round(x),round(y)])
+            if len(r['line'])>=2:self.phase='done'
         self.update()
     def mouseMoveEvent(self,e):
         if self.edit and self.drag is not None:
@@ -113,13 +122,18 @@ class Processor(QThread):
             now=time.time(); dets=[]
             if self.args.demo:
                 self.demo_n+=1; lane=self.demo_n%2; name=list(self.engine.rois)[lane]; poly=self.engine.rois[name]['polygon']; x=sum(p[0] for p in poly)/len(poly)
-                phase=(self.demo_n%180)/180; top=min(p[1] for p in poly); bot=max(p[1] for p in poly); y=top+phase*(bot-top+60)
+                phase=(self.demo_n%180)/180; top=min(p[1] for p in poly); bot=max(p[1] for p in poly)
+                direction=self.engine.rois[name].get('direction','down')
+                y=top+phase*(bot-top+60) if direction=='down' else bot-phase*(bot-top+60)
                 tid=(self.demo_n//180)*2+lane+1; cls=('MP','BUS','TRUK')[(self.demo_n//180)%3];dets=[(tid,cls,.9,(x-18,y-30,x+18,y))]
             else:
                 dets=self.detect(model,label_map,frame)
             events=self.engine.update(dets,now)
             for n,r in self.engine.rois.items():
-                col=(255,0,255) if n=='Cimanggis' else (0,180,255);cv2.polylines(frame,[np.array(r['polygon'],dtype=np.int32)],True,col,2)
+                col=(255,0,255) if n=='Arah_Kiri' else (0,180,255);cv2.polylines(frame,[np.array(r['polygon'],dtype=np.int32)],True,col,2)
+                if r.get('line'):
+                    a,b=r['line'];cv2.line(frame,tuple(map(int,a)),tuple(map(int,b)),col,2)
+                    cv2.putText(frame,f"{n} {r.get('direction','')}",(int(a[0]),int(a[1])-8),cv2.FONT_HERSHEY_SIMPLEX,.45,col,1)
             if not self.args.demo:
                 h,w=frame.shape[:2];cb=self.crop_box(frame.shape)
                 if cb!=(0,0,w,h):cv2.rectangle(frame,(cb[0],cb[1]),(cb[2]-1,cb[3]-1),(90,90,90),1)
@@ -129,12 +143,13 @@ class Processor(QThread):
 
 class Window(QWidget):
     def __init__(self,args):
-        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']]} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self.engine=CountEngine(self.rois,args.lanes,args.lle,args.tb_share,args.bus_bb,args.window,3,args.warmup,args.stitch_sec);self.paused=False;self.edit=False
+        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']], 'line':[list(pt) for pt in r['line']], 'direction':r['direction']} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self.engine=CountEngine(self.rois,args.lanes,args.lle,args.tb_share,args.bus_bb,args.window,3,args.warmup,args.stitch_sec);self.paused=False;self.edit=False
         self.video=VideoView();self.stats=QPlainTextEdit();self.stats.setReadOnly(True);self.log=QPlainTextEdit();self.log.setReadOnly(True);self.status=QLabel('menunggu');self.fps=QLabel('FPS proses: —')
         self.start=QPushButton('Jeda');self.start.clicked.connect(self.toggle);reset=QPushButton('Reset');reset.clicked.connect(self.reset);shot=QPushButton('Simpan screenshot');shot.clicked.connect(self.screenshot)
         edit=QPushButton('Edit ROI');edit.clicked.connect(self.edit_roi);save=QPushButton('Simpan ROI');save.clicked.connect(self.save_roi)
-        self.tb=QLineEdit(str(args.tb_share));self.lanes=QLineEdit(str(args.lanes));self.bus=QLineEdit(str(args.bus_bb));self.roi_choice=QComboBox();self.roi_choice.addItems(list(self.rois));self.roi_choice.currentTextChanged.connect(self.change_roi)
-        right=QVBoxLayout();right.addWidget(self.stats);right.addWidget(self.log);right.addWidget(self.status);right.addWidget(self.fps);form=QFormLayout();form.addRow('ROI',self.roi_choice);form.addRow('tb_share',self.tb);form.addRow('lanes',self.lanes);form.addRow('bus_bb',self.bus);right.addLayout(form)
+        self.tb=QLineEdit(str(args.tb_share));self.lanes=QLineEdit(str(args.lanes));self.bus=QLineEdit(str(args.bus_bb));self.roi_choice=QComboBox();self.roi_choice.addItems(list(self.rois));self.roi_choice.currentTextChanged.connect(self.change_roi);self.edit_mode=QComboBox();self.edit_mode.addItems(['Polygon','Garis hitung']);self.edit_mode.currentTextChanged.connect(self.change_edit_mode);self.direction=QComboBox();self.direction.addItems(['up','down']);self.direction.currentTextChanged.connect(self.change_direction)
+        right=QVBoxLayout();right.addWidget(self.stats);right.addWidget(self.log);right.addWidget(self.status);right.addWidget(self.fps)
+        form=QFormLayout();form.addRow('ROI',self.roi_choice);form.addRow('Mode edit',self.edit_mode);form.addRow('Arah',self.direction);form.addRow('tb_share',self.tb);form.addRow('lanes',self.lanes);form.addRow('bus_bb',self.bus);right.addLayout(form)
         for b in (self.start,reset,edit,save,shot):right.addWidget(b)
         layout=QHBoxLayout(self);layout.addWidget(self.video,3);layout.addLayout(right,1)
         self.reader=Reader(args.source,args.demo,args.referer,args.user_agent);self.processor=Processor(self.reader,self.engine,args);self.processor.rendered.connect(self.show_frame);self.reader.start();self.processor.start();self.video.pointClicked.connect(lambda x,y:None);self.video.dragPoint.connect(self.drag_vertex);self.timer=QTimer(self);self.timer.timeout.connect(self.update_stats);self.timer.start(500)
@@ -155,18 +170,27 @@ class Window(QWidget):
         if p:p.save('out/screenshot.png')
     def edit_roi(self):
         if not self.edit:
-            self.edit=True;self.video.edit=True;self.change_roi(self.roi_choice.currentText());self.paused=True;self.processor.active=False;self.start.setText('Mulai')
-        else:self.edit=False;self.video.edit=False;self.paused=False;self.processor.active=True;self.start.setText('Jeda');self.video.update()
+            self.edit=True;self.video.edit=True;self.change_roi(self.roi_choice.currentText());self.video.phase='poly' if self.edit_mode.currentText()=='Polygon' else 'line';self.paused=True;self.processor.active=False;self.start.setText('Mulai')
+        else:self.edit=False;self.video.edit=False;self.video.phase='done';self.paused=False;self.processor.active=True;self.start.setText('Jeda');self.video.update()
     def change_roi(self,name):
-        self.video.selected=name;self.video.phase='done';self.video.update()
+        self.video.selected=name;self.video.phase='line' if self.edit_mode.currentText()=='Garis hitung' else 'done';self.direction.setCurrentText(self.rois[name].get('direction','down'));self.video.update()
+    def change_edit_mode(self,mode):
+        self.video.phase='line' if mode=='Garis hitung' and self.edit else 'poly' if mode=='Polygon' and self.edit else 'done';self.video.update()
+    def change_direction(self,direction):
+        if hasattr(self,'rois') and self.roi_choice.currentText() in self.rois:
+            self.rois[self.roi_choice.currentText()]['direction']=direction
+
     def drag_vertex(self,x,y):
         if not self.edit or self.video.drag is None:return
         r=self.rois[self.video.selected]
-        if self.video.drag<len(r['polygon']):r['polygon'][self.video.drag]=[round(x),round(y)]
+        kind,index=self.video.drag
+        if kind=='poly' and index<len(r['polygon']):r['polygon'][index]=[round(x),round(y)]
+        elif kind=='line' and index<len(r.get('line',[])):r['line'][index]=[round(x),round(y)]
         self.video.update()
     def save_roi(self):
         bad=[n for n,r in self.rois.items() if len(r['polygon'])<3]
         if bad:QMessageBox.warning(self,'ROI belum lengkap',f"ROI {', '.join(bad)} butuh minimal 3 titik (klik titik, lalu Enter).");return
+        self.rois[self.video.selected]['direction']=self.direction.currentText()
         self.roi_path.write_text(json.dumps({'ref_size':self.ref,'rois':self.rois},indent=2),encoding='utf8');self.engine.rois=self.rois;self.video.rois=self.rois
     def closeEvent(self,event):
         self.reader.running=False;self.processor.go=False;self.reader.wait(3000);self.processor.wait(5000);self.engine.write_csv('out');event.accept()
