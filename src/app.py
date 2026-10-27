@@ -143,7 +143,7 @@ class Processor(QThread):
 
 class Window(QWidget):
     def __init__(self,args):
-        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']], 'line':[list(pt) for pt in r['line']], 'direction':r['direction']} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self.engine=CountEngine(self.rois,args.lanes,args.lle,args.tb_share,args.bus_bb,args.window,3,args.warmup,args.stitch_sec);self.paused=False;self.edit=False
+        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']], 'line':[list(pt) for pt in r['line']], 'direction':r['direction']} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self._roi_frame_size=None;self.engine=CountEngine(self.rois,args.lanes,args.lle,args.tb_share,args.bus_bb,args.window,3,args.warmup,args.stitch_sec);self.paused=False;self.edit=False
         self.video=VideoView();self.stats=QPlainTextEdit();self.stats.setReadOnly(True);self.log=QPlainTextEdit();self.log.setReadOnly(True);self.status=QLabel('menunggu');self.fps=QLabel('FPS proses: —')
         self.start=QPushButton('Jeda');self.start.clicked.connect(self.toggle);reset=QPushButton('Reset');reset.clicked.connect(self.reset);shot=QPushButton('Simpan screenshot');shot.clicked.connect(self.screenshot)
         edit=QPushButton('Edit ROI');edit.clicked.connect(self.edit_roi);save=QPushButton('Simpan ROI');save.clicked.connect(self.save_roi)
@@ -153,9 +153,25 @@ class Window(QWidget):
         for b in (self.start,reset,edit,save,shot):right.addWidget(b)
         layout=QHBoxLayout(self);layout.addWidget(self.video,3);layout.addLayout(right,1)
         self.reader=Reader(args.source,args.demo,args.referer,args.user_agent);self.processor=Processor(self.reader,self.engine,args);self.processor.rendered.connect(self.show_frame);self.reader.start();self.processor.start();self.video.pointClicked.connect(lambda x,y:None);self.video.dragPoint.connect(self.drag_vertex);self.timer=QTimer(self);self.timer.timeout.connect(self.update_stats);self.timer.start(500)
+    def _sync_rois_to_frame(self, frame):
+        h,w=frame.shape[:2]
+        if self._roi_frame_size == (w,h): return
+        rw,rh=self.ref
+        if rw <= 0 or rh <= 0: return
+        sx,sy=w/rw,h/rh
+        if abs(sx-1) < 1e-6 and abs(sy-1) < 1e-6:
+            self._roi_frame_size=(w,h); return
+        # rois.json disimpan pada ref_size; engine dan editor harus memakai
+        # koordinat frame aktual agar line/ROI tidak bergeser pada stream lain.
+        for r in self.rois.values():
+            r['polygon']=[[round(x*sx),round(y*sy)] for x,y in r['polygon']]
+            r['line']=[[round(x*sx),round(y*sy)] for x,y in r.get('line',[])]
+        self.ref=[w,h]
+        self._roi_frame_size=(w,h)
+
     def show_frame(self,frame,events,fps,stream):
-        if self.edit:self.video.set_frame(frame,self.rois)
-        else:self.video.set_frame(frame,self.rois)
+        self._sync_rois_to_frame(frame)
+        self.video.set_frame(frame,self.rois)
         self.fps.setText(f'FPS proses: {fps:.1f}');self.status.setText(stream)
         for e in events:self.log.appendPlainText(f"{time.strftime('%H:%M:%S',time.localtime(e['time']))} | {e['direction']} | {e['class']} | {e['id']} | {e['via']}")
     def update_stats(self):
