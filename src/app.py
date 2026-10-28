@@ -132,10 +132,14 @@ class Processor(QThread):
             if not label_map: raise RuntimeError(f'Nama kelas model tidak dikenali: {model.names}')
             self.classes=list(label_map)
         while self.go:
-            if not self.active:self.msleep(50);continue
+            if not self.active:
+                self.engine.mark_gap(time.time(),'pemrosesan dijeda / edit ROI');self.msleep(50);continue
             with self.lock:frame=self.latest;self.latest=None;stream=self.stream
-            if frame is None:self.msleep(30);continue
+            if frame is None:
+                if stream not in ('terhubung','demo'):self.engine.mark_gap(time.time(),f'stream: {stream}')
+                self.msleep(30);continue
             now=time.time(); dets=[]
+            if stream not in ('terhubung','demo'):self.engine.mark_gap(now,f'stream: {stream}')
             if self.args.demo:
                 self.demo_n+=1; lane=self.demo_n%2; name=list(self.engine.rois)[lane]; poly=self.engine.rois[name]['polygon']; x=sum(p[0] for p in poly)/len(poly)
                 phase=(self.demo_n%180)/180; top=min(p[1] for p in poly); bot=max(p[1] for p in poly)
@@ -159,7 +163,7 @@ class Processor(QThread):
 
 class Window(QWidget):
     def __init__(self,args):
-        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']], 'line':[list(pt) for pt in r['line']], 'direction':r['direction']} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self._roi_frame_size=None;self.engine=CountEngine(self.rois,args.lanes,args.lle,args.tb_share,args.bus_bb,args.window,3,args.warmup,args.stitch_sec);self.paused=False;self.edit=False
+        super().__init__();self.args=args;self.setWindowTitle('Penghitung CCTV — DJ JBH6/2');self.roi_path=Path(args.rois);data=json.loads(self.roi_path.read_text(encoding='utf8'));self.rois={n:{'polygon':[list(pt) for pt in r['polygon']], 'line':[list(pt) for pt in r['line']], 'direction':r['direction']} for n,r in data['rois'].items()};self.ref=data.get('ref_size',[704,576]);self._roi_frame_size=None;self.engine=CountEngine(self.rois,lanes=args.lanes,lle=args.lle,tb_share=args.tb_share,bus_bb=args.bus_bb,stitch_sec=args.stitch_sec);self.paused=False;self.edit=False
         self.video=VideoView();self.stats=QPlainTextEdit();self.stats.setReadOnly(True);self.log=QPlainTextEdit();self.log.setReadOnly(True);self.status=QLabel('menunggu');self.fps=QLabel('FPS proses: —')
         self.start=QPushButton('Jeda');self.start.clicked.connect(self.toggle);reset=QPushButton('Reset');reset.clicked.connect(self.reset);shot=QPushButton('Simpan screenshot');shot.clicked.connect(self.screenshot)
         edit=QPushButton('Edit ROI');edit.clicked.connect(self.edit_roi);save=QPushButton('Simpan ROI');save.clicked.connect(self.save_roi)
@@ -194,7 +198,26 @@ class Window(QWidget):
         try:
             self.engine.lanes=int(self.lanes.text());self.engine.tb_share=float(self.tb.text());self.engine.bus_bb=float(self.bus.text())
         except ValueError:pass
-        now=time.time();self.stats.setPlainText('\n\n'.join(f"{n}\n"+' | '.join(f'{k}: {v}' for k,v in self.engine.summary(n,now).items()) for n in self.rois))
+        now=time.time();panels=[]
+        for name in self.rois:
+            s=self.engine.summary(name,now)
+            if s['period_start'] is None:
+                period='interval dimulai saat data pertama diterima'
+            elif s['period_end'] is None:
+                period=f"interval berjalan sejak {time.strftime('%H:%M:%S',time.localtime(s['period_start']))}"
+            else:
+                period=(f"{time.strftime('%H:%M:%S',time.localtime(s['period_start']))}–"
+                        f"{time.strftime('%H:%M:%S',time.localtime(s['period_end']))}")
+            counts=' | '.join(f'{k}: {v:g}' for k,v in s['counts'].items())
+            if s['period_complete']:
+                result=(f"Q: {s['q']:.2f} SMP/jam | C: {s['C']:.0f} SMP/jam | "
+                        f"DJ: {s['DJ']:.3f} ({s['status']})")
+            else:
+                result=s['status']
+                if s['invalid_reasons']:
+                    result+=f" ({', '.join(s['invalid_reasons'])})"
+            panels.append(f"{name} — periode {period}\nHitungan: {counts}\n{result}")
+        self.stats.setPlainText('\n\n'.join(panels))
     def toggle(self):self.paused=not self.paused;self.processor.active=not self.paused;self.start.setText('Mulai' if self.paused else 'Jeda')
     def reset(self):self.engine.reset();self.log.clear()
     def screenshot(self):
@@ -225,10 +248,10 @@ class Window(QWidget):
         self.rois[self.video.selected]['direction']=self.direction.currentText()
         self.roi_path.write_text(json.dumps({'ref_size':self.ref,'rois':self.rois},indent=2),encoding='utf8');self.engine.rois=self.rois;self.video.rois=self.rois
     def closeEvent(self,event):
-        self.reader.running=False;self.processor.go=False;self.reader.wait(3000);self.processor.wait(5000);self.engine.write_csv('out');event.accept()
+        self.reader.running=False;self.processor.go=False;self.reader.wait(3000);self.processor.wait(5000);self.engine.write_csv('out',time.time());event.accept()
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--source',default='');p.add_argument('--rois',default='rois.json');p.add_argument('--lanes',type=int,default=3);p.add_argument('--lle',type=float,default=3.5);p.add_argument('--tb-share',type=float,default=.3);p.add_argument('--bus-bb',type=float,default=1.);p.add_argument('--window',type=int,default=300);p.add_argument('--warmup',type=int,default=60);p.add_argument('--model',default='yolo26s.pt');p.add_argument('--imgsz',type=int,default=640);p.add_argument('--conf',type=float,default=.3);p.add_argument('--device',default=None);p.add_argument('--referer');p.add_argument('--user-agent');p.add_argument('--crop-margin',type=int,default=40);p.add_argument('--stitch-sec',type=float,default=1.5);p.add_argument('--no-crop',action='store_true');p.add_argument('--demo',action='store_true');args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--source',default='');p.add_argument('--rois',default='rois.json');p.add_argument('--lanes',type=int,default=3);p.add_argument('--lle',type=float,default=3.5);p.add_argument('--tb-share',type=float,default=.3);p.add_argument('--bus-bb',type=float,default=1.);p.add_argument('--model',default='yolo26s.pt');p.add_argument('--imgsz',type=int,default=640);p.add_argument('--conf',type=float,default=.3);p.add_argument('--device',default=None);p.add_argument('--referer');p.add_argument('--user-agent');p.add_argument('--crop-margin',type=int,default=40);p.add_argument('--stitch-sec',type=float,default=1.5);p.add_argument('--no-crop',action='store_true');p.add_argument('--demo',action='store_true');args=p.parse_args()
     if not args.demo and not args.source:p.error('--source diperlukan kecuali --demo')
     app=QApplication(sys.argv);w=Window(args);w.resize(1280,760);w.show();sys.exit(app.exec())
 if __name__=='__main__':main()

@@ -4,7 +4,11 @@ import csv
 import json
 import math
 from collections import Counter, defaultdict, deque
+from datetime import datetime
 from pathlib import Path
+import time
+
+HOUR_SECONDS = 3600
 
 
 def emp_for(total):
@@ -54,12 +58,20 @@ def point_in_poly(point, polygon):
 
 
 class CountEngine:
-    def __init__(self, rois, lanes=3, lle=3.5, tb_share=.3, bus_bb=1., window_sec=300, min_hits=3, warmup_sec=60, stitch_sec=1.5):
+    def __init__(self, rois, lanes=3, lle=3.5, tb_share=.3, bus_bb=1., min_hits=3, stitch_sec=1.5):
         self.rois=rois; self.lanes=lanes; self.lle=lle; self.tb_share=tb_share; self.bus_bb=bus_bb
-        self.window_sec=window_sec; self.min_hits=min_hits; self.warmup_sec=warmup_sec; self.stitch_sec=stitch_sec; self.reset()
+        self.min_hits=min_hits; self.stitch_sec=stitch_sec; self.reset()
 
     def reset(self):
-        self.events=[]; self.counted_ids=set(); self.states={}; self.tracks={}; self.cum=Counter(); self.last_event=None; self.flash=set(); self.started=None; self.recent_lost=[]
+        self.events=[]; self.observations=[]; self.counted_ids=set(); self.states={}; self.tracks={}; self.cum=Counter(); self.last_event=None; self.flash=set(); self.started=None; self.recent_lost=[]; self.invalid_periods=set(); self.invalid_period_reasons=defaultdict(set)
+
+    def mark_gap(self, now, reason='gangguan pengamatan'):
+        """Mark the observation period containing now as incomplete."""
+        if self.started is None:
+            return
+        period_index=int((now-self.started)//HOUR_SECONDS)
+        self.invalid_periods.add(period_index)
+        self.invalid_period_reasons[period_index].add(reason)
 
     def update(self,dets,now):
         # Aturan hitung: kendaraan MULAI dilacak saat titik bawah kotaknya masuk polygon ROI,
@@ -160,24 +172,137 @@ class CountEngine:
         label=s['class'] or 'MP'
         mapping={'MP': [('MP',1)],'KS':[('KS',1)],'BB':[('BB',1)],'TB':[('TB',1)],'BUS':[('BB',self.bus_bb),('KS',1-self.bus_bb)],'TRUK':[('TB',self.tb_share),('KS',1-self.tb_share)]}
         self.counted_ids.add(tid)
+        observation={'time':now,'roi':s['roi'],'class':label,'id':tid,'via':via}
+        self.observations.append(observation)
         for cls,share in mapping.get(label,[]):
             if share: self.events.append({'time':now,'roi':s['roi'],'class':cls,'id':tid,'via':via,'count':share}); self.cum[(s['roi'],cls)]+=share
         event={'time':now,'direction':s['roi'],'class':label,'id':tid,'via':via}; out.append(event); self.last_event=event; self.flash.add(s['roi'])
 
-    def summary(self,roi_name,now):
-        recent=[e for e in self.events if e['roi']==roi_name and now-e['time']<=self.window_sec]
-        counts={c:sum(e['count'] for e in recent if e['class']==c) for c in ('MP','KS','BB','TB')}
-        rates={k:v*3600/self.window_sec for k,v in counts.items()}; total=sum(rates.values()); eks,ebb,etb=emp_for(total)
-        q=rates['MP']+rates['KS']*eks+rates['BB']*ebb+rates['TB']*etb; cap=capacity(self.lanes,self.lle)
-        dj=q/cap if self.started is not None and now-self.started>=self.warmup_sec else None
-        return {'counts':counts,'rates':rates,'total':total,'emp':{'KS':eks,'BB':ebb,'TB':etb},'q':q,'C':cap,'DJ':dj,'status':status_text(dj)}
+    @staticmethod
+    def _period_timestamp(value):
+        return datetime.fromtimestamp(value).astimezone().isoformat(timespec='seconds')
 
-    def write_csv(self,out_dir='out'):
+    def _period_summary(self,roi_name,period_index,now):
+        period_start=self.started+period_index*HOUR_SECONDS
+        period_end=period_start+HOUR_SECONDS
+        complete=now>=period_end
+        observed_end=min(now,period_end)
+        counts={c:0. for c in ('MP','KS','BB','TB')}
+        observed={'MP':0,'KS':0,'BB':0,'TB':0,'BUS':0,'TRUK':0}
+        for event in self.events:
+            if (event['roi']==roi_name and period_start<=event['time']<observed_end
+                    and int((event['time']-self.started)//HOUR_SECONDS)==period_index):
+                counts[event['class']]+=event['count']
+        for event in self.observations:
+            if (event['roi']==roi_name and period_start<=event['time']<observed_end
+                    and int((event['time']-self.started)//HOUR_SECONDS)==period_index):
+                observed[event['class']]+=1
+
+        valid=complete and period_index not in self.invalid_periods
+        if complete:
+            rates=counts.copy()
+            total=sum(observed.values())
+            eks,ebb,etb=emp_for(total)
+            q=rates['MP']+rates['KS']*eks+rates['BB']*ebb+rates['TB']*etb
+            dj=q/capacity(self.lanes,self.lle)
+            status=status_text(dj) if valid else f"{status_text(dj)} (estimasi; data tidak lengkap)"
+            emp={'KS':eks,'BB':ebb,'TB':etb}
+        else:
+            rates=None; total=None; q=None; dj=None; emp=None
+            status='periode tidak lengkap' if period_index in self.invalid_periods else 'mengumpulkan data'
+        invalid_reasons=sorted(self.invalid_period_reasons.get(period_index,()))
+        return {
+            'counts':counts,'rates':rates,'total':total,'emp':emp,'q':q,
+            'C':capacity(self.lanes,self.lle),'DJ':dj,'status':status,
+            'period_start':period_start,'period_end':period_end,
+            'period_complete':complete,'period_valid':valid,
+            'observed':observed,'invalid_reasons':invalid_reasons,
+        }
+
+    def summary(self,roi_name,now):
+        if self.started is None:
+            return {
+                'counts':{c:0. for c in ('MP','KS','BB','TB')},
+                'rates':None,'total':None,'emp':None,'q':None,
+                'C':capacity(self.lanes,self.lle),'DJ':None,
+                'status':'mengumpulkan data','period_start':None,
+                'period_end':None,'period_complete':False,'period_valid':False,
+                'observed':{'MP':0,'KS':0,'BB':0,'TB':0,'BUS':0,'TRUK':0},
+                'invalid_reasons':[],
+            }
+        elapsed=max(0.,now-self.started)
+        completed_index=int(elapsed//HOUR_SECONDS)-1
+        period_index=completed_index if completed_index>=0 else 0
+        return self._period_summary(roi_name,period_index,now)
+
+    def _hourly_rows(self,now):
+        if self.started is None:
+            return
+        elapsed=max(0.,now-self.started)
+        period_count=max(1,math.ceil(elapsed/HOUR_SECONDS))
+        for period_index in range(period_count):
+            for roi_name in self.rois:
+                data=self._period_summary(roi_name,period_index,now)
+                counts=data['counts']; observed=data['observed']
+                emp=data['emp'] or {}
+                capacity_value=data['C']
+                c0=2500
+                fcle=capacity_value/(self.lanes*c0) if self.lanes else 0
+                yield {
+                    'period_start':self._period_timestamp(data['period_start']),
+                    'period_end':self._period_timestamp(data['period_end']),
+                    'observed_seconds':round(min(HOUR_SECONDS,max(0.,now-data['period_start'])),3),
+                    'direction':roi_name,
+                    'period_complete':data['period_complete'],
+                    'period_valid':data['period_valid'],
+                    'status':data['status'],
+                    'invalid_reasons':'; '.join(data['invalid_reasons']),
+                    'vehicles_total':sum(observed.values()),
+                    'observed_mp':observed['MP'],
+                    'observed_ks':observed['KS'],
+                    'observed_bb':observed['BB'],
+                    'observed_tb':observed['TB'],
+                    'observed_bus':observed['BUS'],
+                    'observed_truck':observed['TRUK'],
+                    'ks_smp_equiv':round(counts['KS'],3),
+                    'bb_smp_equiv':round(counts['BB'],3),
+                    'tb_smp_equiv':round(counts['TB'],3),
+                    'emp_ks':emp.get('KS'),
+                    'emp_bb':emp.get('BB'),
+                    'emp_tb':emp.get('TB'),
+                    'q_smp_per_hour':round(data['q'],3) if data['q'] is not None else '',
+                    'capacity_smp_per_hour':round(capacity_value,3),
+                    'dj':round(data['DJ'],8) if data['DJ'] is not None else '',
+                    'lanes':self.lanes,
+                    'lle_m':self.lle,
+                    'c0_smp_per_lane':c0,
+                    'fcle':round(fcle,4),
+                    'tb_share':self.tb_share,
+                    'bus_bb':self.bus_bb,
+                }
+
+    def write_csv(self,out_dir='out',now=None):
+        if now is None:
+            now=time.time()
         path=Path(out_dir); path.mkdir(parents=True,exist_ok=True)
         with (path/'events.csv').open('w',newline='',encoding='utf-8') as f:
-            w=csv.DictWriter(f,fieldnames=['time','direction','class','id','via']); w.writeheader(); w.writerows({k:e[k] for k in w.fieldnames} for e in self._unique_events())
+            fields=['time','direction','class','id','via'];w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
+            w.writerows({'time':e['time'],'direction':e['roi'],'class':e['class'],'id':e['id'],'via':e['via']} for e in self.observations)
         with (path/'ringkasan.csv').open('w',newline='',encoding='utf-8') as f:
             fields=['direction','class','count']; w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows({'direction':r,'class':c,'count':v} for (r,c),v in self.cum.items())
+        with (path/'ringkasan_jam.csv').open('w',newline='',encoding='utf-8') as f:
+            fields=[
+                'period_start','period_end','observed_seconds','direction',
+                'period_complete','period_valid','status','vehicles_total',
+                'invalid_reasons',
+                'observed_mp','observed_ks','observed_bb','observed_tb',
+                'observed_bus','observed_truck','ks_smp_equiv','bb_smp_equiv',
+                'tb_smp_equiv','emp_ks','emp_bb','emp_tb','q_smp_per_hour',
+                'capacity_smp_per_hour','dj','lanes','lle_m',
+                'c0_smp_per_lane','fcle','tb_share','bus_bb',
+            ]
+            w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
+            w.writerows(self._hourly_rows(now))
 
     def _unique_events(self):
         seen=set()
